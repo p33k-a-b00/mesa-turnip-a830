@@ -1,0 +1,84 @@
+name: Build Turnip Driver
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout mesa source
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build patchelf flex bison python3-pip python3-mako unzip curl ccache zip glslang-tools
+          pip install meson mako
+
+      - name: Download Android NDK r29
+        run: |
+          curl -sL https://dl.google.com/android/repository/android-ndk-r29-linux.zip -o ndk.zip
+          unzip -q ndk.zip
+
+      - name: Create meson cross file
+        run: |
+          NDK="$PWD/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          mkdir -p bin
+          ln -sf "$NDK/clang" "$PWD/bin/cc"
+          ln -sf "$NDK/clang++" "$PWD/bin/c++"
+          cat > android-aarch64 << CROSSEOF
+          [binaries]
+          ar = '$NDK/llvm-ar'
+          c = ['ccache', '$NDK/aarch64-linux-android34-clang']
+          cpp = ['ccache', '$NDK/aarch64-linux-android34-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '-static-libstdc++', '-Wno-c++11-narrowing']
+          c_ld = 'lld'
+          cpp_ld = 'lld'
+          strip = '$NDK/llvm-strip'
+          pkgconfig = ['env', 'PKG_CONFIG_LIBDIR=NDKDIR/pkgconfig', '/usr/bin/pkg-config']
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          CROSSEOF
+
+      - name: Configure meson build
+        run: |
+          meson setup build-android-aarch64 \
+            --cross-file android-aarch64 \
+            -Dbuildtype=release \
+            -Dplatforms=android \
+            -Dplatform-sdk-version=36 \
+            -Dandroid-stub=true \
+            -Dgallium-drivers= \
+            -Dvulkan-drivers=freedreno \
+            -Dfreedreno-kmds=kgsl \
+            -Degl=disabled \
+            -Db_lto=false
+
+      - name: Build
+        run: ninja -C build-android-aarch64
+
+      - name: Package driver
+        run: |
+          mkdir -p turnip_driver
+          cp build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so turnip_driver/
+          cp build-android-aarch64/src/android_stub/libhardware.so turnip_driver/
+          cp build-android-aarch64/src/android_stub/libsync.so turnip_driver/
+          cp build-android-aarch64/src/android_stub/libbacktrace.so turnip_driver/
+          cd turnip_driver
+          patchelf --set-soname vulkan.adreno.so libvulkan_freedreno.so
+          mv libvulkan_freedreno.so vulkan.adreno.so
+          MESA_VER=$(cat ../VERSION)
+          GIT_SHORT=$(git -C .. rev-parse --short HEAD)
+          printf '{\n  "schemaVersion": 1,\n  "name": "Turnip A830",\n  "description": "Custom Turnip for Adreno 830",\n  "author": "p33k-a-b00",\n  "packageVersion": "'"$MESA_VER-$GIT_SHORT"'",\n  "vendor": "Mesa",\n  "driverVersion": "'"$MESA_VER"'",\n  "minApi": 31,\n  "libraryName": "vulkan.adreno.so"\n}\n' > meta.json
+          zip -r ../turnip-a830.zip .
+
+      - name: Upload driver artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: turnip-a830
+          path: turnip-a830.zip
